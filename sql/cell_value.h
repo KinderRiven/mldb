@@ -393,7 +393,7 @@ struct CellValue {
     /** Return the number of bytes that this CellValue would serialize
         into when serialized.
     */
-    uint64_t serializedBytes() const;
+    uint64_t serializedBytes(bool exactBytesAvailable) const;
 
     /** Serialize the CellValue into the given memory buffer.  This will
         return the new value of start once done, which will be

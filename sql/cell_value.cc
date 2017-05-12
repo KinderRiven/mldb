@@ -15,6 +15,7 @@
 #include "mldb/types/vector_description.h"
 #include "mldb/types/itoa.h"
 #include "mldb/arch/bitops.h"
+#include "mldb/arch/endian.h"
 #include "cell_value_impl.h"
 #include "mldb/base/parse_context.h"
 #include "mldb/compiler/compiler.h"
@@ -24,6 +25,7 @@
 #include "mldb/utils/possibly_dynamic_buffer.h"
 #include "mldb/base/less.h"
 #include "mldb/jml/db/compact_size_types.h"
+#include "mldb/jml/utils/hex_dump.h"
 
 
 using namespace std;
@@ -1454,15 +1456,93 @@ memusage() const
     throw HttpReturnException(400, "unknown CellValue type");
 }
 
-struct SerizilationCode {
-    uint8_t type:4;  // Matches the CellType
-    uint8_t len:4;   // Extra information that can be used to improve compression
+namespace {
+
+enum CellValueCategory {
+    CVC_SPECIAL = 0,
+    CVC_INTEGER = 1,
+    CVC_UNSIGNED = 2,
+    CVC_FLOAT = 3,
+    CVC_ASCII_STRING = 4,
+    CVC_UTF8_STRING = 5,
+    CVC_TIMESTAMP = 6,
+    CVC_TIME_INTERVAL = 7,
+    CVC_BLOB = 8,
+    CVC_PATH = 9
 };
+    
+
+enum CellValueTag {
+    CVT_INVAID             = CVC_SPECIAL       * 16 +  0,
+    CVT_EMPTY              = CVC_SPECIAL       * 16 +  1,
+    CVT_INTEGER            = CVC_INTEGER       * 16 +  0,
+    CVT_UNSIGNED_DIRECT    = CVC_UNSIGNED      * 16 +  0,
+    CVT_UNSIGNED_INDIRECT  = CVC_UNSIGNED      * 16 + 15,
+    CVT_DOUBLE             = CVC_FLOAT         * 16 +  0,
+    CVT_TIMESTAMP_DOUBLE   = CVC_TIMESTAMP     * 16 +  0,
+    CVT_TIME_INTERVAL      = CVC_TIME_INTERVAL * 16 +  0,
+    CVT_ASCII_SHORT_STRING = CVC_ASCII_STRING  * 16 +  0,
+    CVT_ASCII_LONG_STRING  = CVC_ASCII_STRING  * 16 + 15,
+    CVT_UTF8_SHORT_STRING  = CVC_UTF8_STRING   * 16 +  0,
+    CVT_UTF8_LONG_STRING   = CVC_UTF8_STRING   * 16 + 15,
+    CVT_SHORT_BLOB         = CVC_BLOB          * 16 +  0,
+    CVT_LONG_BLOB          = CVC_BLOB          * 16 + 15,
+    CVT_NULL_PATH          = CVC_PATH          * 16 +  0,
+    CVT_SHORT_PATH         = CVC_PATH          * 16 +  1,
+    CVT_LONG_PATH          = CVC_PATH          * 16 + 14
+};
+
+template<typename T>
+void serializeBinary(char * & start, const T & bits)
+{
+    LittleEndian<T> bitsToSerialize{bits};
+    memcpy(start, &bitsToSerialize, sizeof(bitsToSerialize));
+    start += sizeof(bitsToSerialize);
+}
+
+// TODO: maybe the other order...
+void serializeUnsigned(char * & start, uint64_t bits)
+{
+    while (bits) {
+        *start++ = bits;
+        bits >>= 8;
+    }
+}
+
+size_t serializeUnsignedLength(uint64_t bits)
+{
+    return 1 + highest_bit(bits, -1) / 8;
+}
+
+template<typename T>
+void reconstituteBinary(const char * & start, T & bits)
+{
+    LittleEndian<T> bitsToReconstitute;
+    memcpy(&bitsToReconstitute, start, sizeof(bitsToReconstitute));
+    bits = bitsToReconstitute;
+    start += sizeof(bitsToReconstitute);
+}
+
+// TODO: maybe the other order...
+uint64_t reconstituteUnsigned(const char * & start, size_t length)
+{
+    ExcAssertLessEqual(length, 8);
+    uint64_t result = 0;
+    for (int i = length - 1;  i >= 0;  --i) {
+        unsigned char c = start[i];
+        result = (result << 8) + c;
+    }
+    start += length;
+    return result;
+}
+
+} // file scope
 
 uint64_t
 CellValue::
-serializedBytes() const
+serializedBytes(bool exactBytesAvailable) const
 {
+    bool needToSerializeLength = !exactBytesAvailable;
     switch (type) {
     case ST_EMPTY:
         return 1;
@@ -1471,16 +1551,19 @@ serializedBytes() const
     case ST_TIMEINTERVAL:
         return 13;
     case ST_INTEGER:
-        return 2 + highest_bit(-intVal, -1) / 8;
+        if (intVal < 0) {
+            return 1 + needToSerializeLength + serializeUnsignedLength(-intVal);
+        }
+        // fall through
     case ST_UNSIGNED:
-        // 0 to 7 are encoded directly
-        // 8-15 is the number of bytes (1-8) followed by that number
-        if (uintVal < 7) {
+        // 0 to 15 are encoded directly
+        // 16+ is the number of bytes (1-8) followed by that number
+        if (uintVal < 15) {
             return 1;
         }
         else {
-            size_t numBytes = highest_bit(uintVal) / 8 + 1;
-            return numBytes += 1;
+            size_t numBytes = serializeUnsignedLength(uintVal);
+            return numBytes + 1 + needToSerializeLength;
         }
     case ST_FLOAT:
         // TODO: detect when we don't need all of the bits
@@ -1493,14 +1576,23 @@ serializedBytes() const
     case ST_UTF8_SHORT_STRING:
     case ST_ASCII_LONG_STRING:
     case ST_UTF8_LONG_STRING:
-    case ST_LONG_BLOB:
+    case ST_LONG_BLOB: {
+        size_t len = toStringLength();
+        if (len < 15) {
+            return len + 1 + needToSerializeLength;
+        } else {
+            return 1 + len
+                + needToSerializeLength * ML::DB::compact_encode_length(len);
+        }
+    }
     case ST_SHORT_PATH:
     case ST_LONG_PATH: {
         size_t len = toStringLength();
-        if (len < 15) {
+        if (len < 14) {
             return len + 1;
         } else {
-            return 1 + ML::DB::compact_encode_length(len) + len;
+            return 1 + len
+                + needToSerializeLength * ML::DB::compact_encode_length(len);
         }
     }
     }
@@ -1513,7 +1605,136 @@ CellValue::
 serialize(char * start, size_t bytesAvailable,
           bool exactBytesAvailable)
 {
-    throw HttpReturnException(600, "CellValue::serialize()");
+    size_t bytesRequired = serializedBytes(exactBytesAvailable);
+    if (bytesAvailable < bytesRequired)
+        throw HttpReturnException
+            (500,
+             "Wrong number of bytes available serializing CellValue "
+             + jsonEncodeStr(*this));
+    char * oldStart = start;
+    
+
+    switch (type) {
+    case ST_EMPTY:
+        *start++ = CVT_EMPTY;
+        break;
+    case ST_TIMESTAMP:
+        *start++ = CVT_TIMESTAMP_DOUBLE;
+        serializeBinary(start, timestamp);
+        break;
+        // TODO: detect integers, milliseconds, etc, make them smaller
+    case ST_TIMEINTERVAL:
+        *start++ = CVT_TIME_INTERVAL;
+        serializeBinary(start, timeInterval.months);
+        serializeBinary(start, timeInterval.days);
+        serializeBinary(start, timeInterval.seconds);
+        break;
+    case ST_INTEGER:
+        if (intVal < 0) {
+            *start++ = CVT_INTEGER + 1 + serializeUnsignedLength(-intVal);
+            serializeUnsigned(start, -intVal);
+            break;
+        }
+        // fall through
+    case ST_UNSIGNED:
+        if (uintVal < 15) {
+            // 0 to 7 are encoded directly
+            *start++ = CVT_UNSIGNED_DIRECT + uintVal;
+        }
+        else {
+            // 8-15 is the number of bytes (1-8) followed by that number
+            *start++ = CVT_UNSIGNED_INDIRECT;
+            // How many bytes?
+            if (!exactBytesAvailable)
+                *start++ = serializeUnsignedLength(uintVal);
+            serializeUnsigned(start, uintVal);
+        }
+        break;
+    case ST_FLOAT:
+        *start++ = CVT_DOUBLE;
+        serializeBinary(start, floatVal);
+        break;
+
+    // The rest of them are string-like
+    // Strings of size less than 15 have their length encoded in the
+    // first byte.  Others have a length followed by the contents.
+    case ST_ASCII_SHORT_STRING:
+    case ST_ASCII_LONG_STRING:
+    case ST_SHORT_BLOB:
+    case ST_LONG_BLOB:
+    case ST_UTF8_SHORT_STRING:
+    case ST_UTF8_LONG_STRING:
+    case ST_SHORT_PATH:
+    case ST_LONG_PATH: {
+        size_t len = toStringLength();
+        if (len < 15) {
+            char typeByte = 0;
+            switch (cellType()) {
+            case ASCII_STRING:
+                typeByte = CVT_ASCII_SHORT_STRING + len;  break;
+            case UTF8_STRING:
+                typeByte = CVT_UTF8_SHORT_STRING + len;  break;
+            case BLOB:
+                typeByte = CVT_SHORT_BLOB + len;  break;
+            case PATH:
+                typeByte = CVT_SHORT_PATH + len;  break;
+            default:
+                throw HttpReturnException(500, "unknown type in CellValue serialization");
+            }
+            *start++ = typeByte;
+        }
+        else {
+            char typeByte = 0;
+            switch (cellType()) {
+            case ASCII_STRING:
+                typeByte = CVT_ASCII_LONG_STRING;  break;
+            case UTF8_STRING:
+                typeByte = CVT_UTF8_LONG_STRING;  break;
+            case BLOB:
+                typeByte = CVT_SHORT_BLOB;  break;
+            case PATH:
+                typeByte = CVT_SHORT_PATH;  break;
+            default:
+                throw HttpReturnException(500, "unknown type in CellValue serialization");
+            }
+            *start++ = typeByte;
+            if (!exactBytesAvailable)
+                ML::DB::encode_compact(start, start + len, len);
+        }
+        memcpy(start, stringChars(), len);
+        start += len;
+        break;
+    }
+    default:
+        throw HttpReturnException(400, "unknown CellValue type");
+    }
+
+    if (start - oldStart != bytesRequired) {
+        cerr << "error serializing " << jsonEncodeStr(*this)
+             << " of type " << jsonEncodeStr(type) << endl;
+    }
+    ExcAssertEqual(start - oldStart, bytesRequired);
+
+    CellValue reconstituted;
+    size_t numBytes;
+    try {
+        std::tie(reconstituted, numBytes)
+            = reconstitute(oldStart, bytesAvailable, 1, exactBytesAvailable);
+
+        ExcAssertEqual(numBytes, bytesRequired);
+    } catch (...) {
+        cerr << "trying to reconstitute " << jsonEncodeStr(*this)
+             << endl;
+        ML::hex_dump(oldStart, start - oldStart);
+    }
+
+    if (reconstituted != *this) {
+        cerr << "should be: " << jsonEncodeStr(*this) << endl;
+        cerr << "got: " << jsonEncodeStr(reconstituted) << endl;
+        ExcAssertEqual(*this, reconstituted);
+    }
+
+    return start;
 }
 
 uint8_t
@@ -1526,11 +1747,170 @@ serializationFormat(bool exactBytesAvailable)
 std::pair<CellValue, ssize_t>
 CellValue::
 reconstitute(const char * buf,
-                 size_t bytesAvailable,
-                 uint8_t serializationFormat,
-                 bool exactBytesAvailable)
+             size_t bytesAvailable,
+             uint8_t serializationFormat,
+             bool exactBytesAvailable)
 {
-    throw HttpReturnException(600, "CellValue::reconstitute()");
+    if (serializationFormat != 1) {
+        throw HttpReturnException
+            (500, "Attempt to reconstitute unknown CellValue format "
+             + jsonEncodeStr((int)serializationFormat));
+    }
+
+    if (bytesAvailable < 1) {
+        throw HttpReturnException
+            (500, "Attempt to reconstitute CellValue at end of buffer");
+    }
+
+    const char * oldBuf = buf;
+
+    unsigned char indicator = *buf++;
+    
+    unsigned category = indicator >> 4;
+
+    CellValue result;
+    
+    switch (category) {
+    case CVC_SPECIAL:
+        switch (indicator) {
+        case CVT_EMPTY:
+            break;
+        default:
+            throw HttpReturnException
+                (500, "Unknown CellValue special code");
+        }
+        break;
+    case CVC_INTEGER: {
+        int length = indicator - CVT_INTEGER;
+        if (length > 8) {
+            throw HttpReturnException
+                (500, "Unknown CellValue integer code");
+        }
+        result = -reconstituteUnsigned(buf, length);
+        break;
+    }
+    case CVC_UNSIGNED: {
+        int length = indicator - CVT_UNSIGNED_DIRECT;
+        //cerr << "length = " << length << endl;
+        if (length < 15) {
+            result = length;
+        }
+        else {
+            size_t length = exactBytesAvailable ? bytesAvailable - 1 : *buf++;
+            //cerr << "length is now " << length << endl;
+            result = reconstituteUnsigned(buf, length);
+            //cerr << "result = " << result << endl;
+        }
+        break;
+    }
+    case CVC_FLOAT:
+        switch (indicator) {
+        case CVT_DOUBLE: {
+            double val;
+            reconstituteBinary(buf, val);
+            result = val;
+            break;
+        }
+        default:
+            throw HttpReturnException
+                (500, "Unknown CellValue float code "
+                 + jsonEncodeStr((int)indicator));
+        }
+        break;
+        
+    case CVC_TIMESTAMP:
+        switch (indicator) {
+        case CVT_TIMESTAMP_DOUBLE: {
+            double ts = result.timestamp;
+            reconstituteBinary(buf, ts);
+            result = Date::fromSecondsSinceEpoch(ts);
+            break;
+        }
+        default:
+            throw HttpReturnException
+                (500, "Unknown CellValue float code");
+        }
+        break;
+
+    case CVC_TIME_INTERVAL:
+        switch (indicator) {
+        case CVT_TIME_INTERVAL: {
+            uint16_t months;
+            uint16_t days;
+            double   seconds;
+            
+            reconstituteBinary(buf, months);
+            reconstituteBinary(buf, days);
+            reconstituteBinary(buf, seconds);
+
+            result = CellValue::fromMonthDaySecond(months, days, seconds);
+            break;
+        default:
+            throw HttpReturnException
+                (500, "Unknown CellValue time interval code");
+        }
+        }
+        break;
+        
+    case CVC_ASCII_STRING:
+    case CVC_UTF8_STRING:
+    case CVC_BLOB: {
+        size_t length = indicator % 16;
+        if (length == 15) {
+            if (exactBytesAvailable) {
+                length = bytesAvailable - 1;
+            }
+            else {
+                length = ML::DB::decode_compact(buf, buf + bytesAvailable - 1);
+            }
+        }
+
+        switch (category) {
+        case CVC_ASCII_STRING:
+        case CVC_UTF8_STRING:
+            result = CellValue(buf, length);
+            break;
+        case CVC_BLOB:
+            result = CellValue::blob(buf, length);
+            break;
+        }
+        buf += length;
+        break;
+    }
+        
+    case CVC_PATH: {
+        size_t length = indicator % 16;
+        if (length == 0) {
+            result = CellValue(Path());
+        }
+        else length -= 1;
+        if (length == 14) {
+            if (exactBytesAvailable) {
+                length = bytesAvailable - 2;
+            }
+            else {
+                length = ML::DB::decode_compact(buf, buf + bytesAvailable);
+            }
+        }
+        
+        result = CellValue(Path::parse(buf, length));
+        break;
+    }   
+
+    default:
+        throw HttpReturnException
+            (500, "Unknown CellValue category");
+    }
+
+    size_t bytesUsed = buf - oldBuf;
+    if (exactBytesAvailable && bytesUsed != bytesAvailable) {
+        cerr << "bytesUsed = " << bytesUsed << endl;
+        cerr << "bytesAvailable = " << bytesAvailable << endl;
+        throw HttpReturnException
+            (500, "Error reconstituting CellValue: wrong bytes used");
+    }
+    
+    return {result, buf - oldBuf};
 }
 
 struct CellValueDescription: public ValueDescriptionT<CellValue> {
