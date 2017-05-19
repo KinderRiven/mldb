@@ -1500,18 +1500,21 @@ void serializeBinary(char * & start, const T & bits)
     start += sizeof(bitsToSerialize);
 }
 
+size_t serializeUnsignedLength(uint64_t bits)
+{
+    return 1 + highest_bit(bits, -1) / 8;
+}
+
 // TODO: maybe the other order...
 void serializeUnsigned(char * & start, uint64_t bits)
 {
+    char * oldStart = start;
+    uint64_t oldBits = bits;
     while (bits) {
         *start++ = bits;
         bits >>= 8;
     }
-}
-
-size_t serializeUnsignedLength(uint64_t bits)
-{
-    return 1 + highest_bit(bits, -1) / 8;
+    ExcAssertEqual(start - oldStart, serializeUnsignedLength(oldBits));
 }
 
 template<typename T>
@@ -1552,7 +1555,7 @@ serializedBytes(bool exactBytesAvailable) const
         return 13;
     case ST_INTEGER:
         if (intVal < 0) {
-            return 1 + needToSerializeLength + serializeUnsignedLength(-intVal);
+            return 1 + needToSerializeLength + serializeUnsignedLength(-1ULL * intVal);
         }
         // fall through
     case ST_UNSIGNED:
@@ -1631,18 +1634,19 @@ serialize(char * start, size_t bytesAvailable,
         break;
     case ST_INTEGER:
         if (intVal < 0) {
-            *start++ = CVT_INTEGER + 1 + serializeUnsignedLength(-intVal);
-            serializeUnsigned(start, -intVal);
+            *start++ = CVT_INTEGER + serializeUnsignedLength(-intVal);
+            serializeUnsigned(start, -1LL * intVal);
             break;
         }
         // fall through
     case ST_UNSIGNED:
         if (uintVal < 15) {
-            // 0 to 7 are encoded directly
+            // 0 to 14 are encoded directly
             *start++ = CVT_UNSIGNED_DIRECT + uintVal;
         }
         else {
-            // 8-15 is the number of bytes (1-8) followed by that number
+            // 15 is the number of bytes (1-8) followed by that number of
+            // bytes representing the actual value
             *start++ = CVT_UNSIGNED_INDIRECT;
             // How many bytes?
             if (!exactBytesAvailable)
@@ -1729,8 +1733,8 @@ serialize(char * start, size_t bytesAvailable,
     }
 
     if (reconstituted != *this) {
-        cerr << "should be: " << jsonEncodeStr(*this) << endl;
-        cerr << "got: " << jsonEncodeStr(reconstituted) << endl;
+        cerr << "should be: " << jsonEncodeStr(*this) << " type " << type << endl;
+        cerr << "got: " << jsonEncodeStr(reconstituted) << " type " << reconstituted.type << endl;
         ExcAssertEqual(*this, reconstituted);
     }
 
@@ -1786,7 +1790,8 @@ reconstitute(const char * buf,
             throw HttpReturnException
                 (500, "Unknown CellValue integer code");
         }
-        result = -reconstituteUnsigned(buf, length);
+        int64_t val = reconstituteUnsigned(buf, length);
+        result = -val;
         break;
     }
     case CVC_UNSIGNED: {
