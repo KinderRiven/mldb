@@ -370,7 +370,7 @@ struct TabularDataset::TabularDataStore
         ColumnPath columnName;
 
         /// The number of non-null values of this row
-        size_t rowCount = 0;
+        size_t nonNullRowCount = 0;
 
         /// The set of chunks that contain the column.  This may not be all
         /// chunks for sparse columns.
@@ -477,7 +477,7 @@ struct TabularDataset::TabularDataStore
             const ColumnEntry & entry = columns[it->second];
 
             std::vector<CellValue> result;
-            result.reserve(entry.rowCount);
+            result.reserve(entry.nonNullRowCount);
 
             // Go through each chunk with a non-null value
             for (auto & c: entry.chunks) {
@@ -1308,6 +1308,8 @@ struct TabularDataset::TabularDataStore
             ExcAssertEqual(fixedColumns.size(), chunk.fixedColumnCount());
             for (size_t j = 0;  j < chunk.columns.size();  ++j) {
                 newState->columns[j].chunks.emplace_back(i, chunk.columns[j]);
+                newState->columns[j].nonNullRowCount
+                    += chunk.columns[j]->nonNullRowCount();
             }
             for (auto & c: chunk.sparseColumns) {
                 auto it = newState->columnIndex
@@ -1321,6 +1323,8 @@ struct TabularDataset::TabularDataStore
                     newState->columnHashIndex[c.first] = it->second;
                 }
                 newState->columns[it->second].chunks.emplace_back(i, c.second);
+                newState->columns[it->second].nonNullRowCount
+                    += c.second->nonNullRowCount();
             }
         }
         
