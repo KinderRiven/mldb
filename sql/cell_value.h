@@ -410,7 +410,7 @@ struct CellValue {
         saved potentially saving space.
     */
     char * serialize(char * start, size_t bytesAvailable,
-                     bool exactBytesAvailable);
+                     bool exactBytesAvailable) const;
     
     /** Return a number that will indicate what serialization format is
         being used in this file.  That number should be stored once in

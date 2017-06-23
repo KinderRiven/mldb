@@ -1606,7 +1606,7 @@ serializedBytes(bool exactBytesAvailable) const
 char *
 CellValue::
 serialize(char * start, size_t bytesAvailable,
-          bool exactBytesAvailable)
+          bool exactBytesAvailable) const
 {
     size_t bytesRequired = serializedBytes(exactBytesAvailable);
     if (bytesAvailable < bytesRequired)
