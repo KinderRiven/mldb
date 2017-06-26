@@ -252,9 +252,9 @@ struct PathIndexShard {
         return chunk > 0;
     }
 
-    void serialize(MappedSerializer & serializer) const
+    void serialize(StructuredSerializer & serializer) const
     {
-        filter_ostream stream = serializer.getStream();
+        filter_ostream stream = serializer.newStream("md");
         ML::DB::Store_Writer store(stream);
         store
             << uint8_t(1) // version
@@ -263,7 +263,7 @@ struct PathIndexShard {
             << ML::DB::compact_size_t(numEntries)
             << factor;
         stream.close();
-        storage.reserialize(serializer);
+        serializer.addRegion(storage, "rowindex");
     }
 
     // Hash is implicit via position in the entry map (we take the top x bits)
@@ -308,10 +308,11 @@ struct PathIndex {
         return result;
     }
 
-    void serialize(MappedSerializer & serializer) const
+    void serialize(StructuredSerializer & serializer) const
     {
-        for (auto & sh: shards) {
-            sh.serialize(serializer);
+        for (size_t i = 0;  i < INDEX_SHARDS;  ++i) {
+            shards[i].serialize
+                (*serializer.newStructure("shard" + std::to_string(i)));
         }
     }
 
@@ -894,7 +895,7 @@ struct TabularDataset::TabularDataStore
             // Now the things that change, such as column lists, indexes
             // etc
 
-            rowIndex.serialize(*serializer.newEntry("ri"));
+            rowIndex.serialize(*serializer.newStructure("ri"));
 
             {
                 auto colSerializer = serializer.newEntry("cs");
