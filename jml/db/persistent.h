@@ -24,7 +24,8 @@ template<class X>
 Store_Writer &
 operator << (Store_Writer & store, const X & x)
 {
-    store.save(x);
+    using ML::DB::save;
+    save(store, x);
     return store;
 }
 
@@ -32,7 +33,8 @@ template<class X>
 Store_Reader &
 operator >> (Store_Reader & store, X & x)
 {
-    store.load(x);
+    using ML::DB::load;
+    load(store, x);
     return store;
 }
 
