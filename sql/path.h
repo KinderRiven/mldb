@@ -5,7 +5,6 @@
     This file is part of MLDB. Copyright 2016 mldb.ai inc. All rights reserved.
 */
 
-#include "dataset_fwd.h"
 #include "mldb/types/string.h"
 #include "mldb/types/value_description_fwd.h"
 #include "mldb/base/exc_assert.h"
@@ -24,6 +23,8 @@ namespace MLDB {
 
 struct Path;
 std::ostream & operator << (std::ostream & stream, const Path & id);
+
+template<int Domain> struct HashWrapper;
 
 /*****************************************************************************/
 /* PATH ELEMENT                                                              */
@@ -778,8 +779,8 @@ struct Path {
     Path operator + (const PathElement & other) const;
     Path operator + (PathElement && other) const;
 
-    operator RowHash() const;
-    operator ColumnHash() const;
+    operator HashWrapper<1>() const;
+    operator HashWrapper<3>() const;
 
     bool startsWith(const PathElement & prefix) const;
     bool startsWith(const Path & prefix) const;
